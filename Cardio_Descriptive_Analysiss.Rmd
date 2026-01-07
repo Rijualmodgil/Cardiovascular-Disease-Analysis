@@ -1,0 +1,291 @@
+---
+title: "Cardiovascular Disease Analysis - Descriptive & Predictive Analysis in R"
+author: |
+  Student 1: Rijual Modgil (Roll No: 21 | Reg No: 12312704)
+date: "2025-11-16"
+output:
+  html_document:
+    toc: true
+    toc_depth: 6
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    code_folding: none
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 8)
+
+# Load necessary libraries
+library(tidyverse)
+library(readr)
+library(janitor)
+library(caret)
+library(pROC)
+library(cluster)
+library(factoextra)
+library(class)
+library(corrplot)
+library(RColorBrewer)
+library(broom)
+library(knitr)
+```
+
+## Introduction
+
+This project analyzes risk factors associated with cardiovascular disease (CVD). We use a patient dataset containing biometric measurements and lifestyle indicators to perform descriptive analytics, clustering, and classification (logistic regression & KNN). The workflow follows: data import, cleaning, EDA, modeling, clustering, and conclusions.
+
+## Load data
+
+Provide the full path to your CSV file. The original dataset (Kaggle-style) is often semicolon or comma separated — adjust `read_csv2()` vs `read_csv()` as needed.
+
+```{r}
+# Update this path to where your `cardio_train.csv` lives
+file_path <- "C:/Users/rijua/Downloads/CVD DATASET/cardio_train.csv"
+
+# Try read_csv2 in case file is semicolon-separated; fallback to read_csv
+data_raw <- tryCatch(
+  readr::read_csv2(file_path),
+  error = function(e) readr::read_csv(file_path)
+)
+
+# Standardize column names
+names(data_raw) <- names(data_raw) %>% tolower() %>% str_replace_all("\s+", "_")
+glimpse(data_raw)
+```
+
+## Data cleaning & preprocessing
+
+We make names R-friendly, convert coded columns to factors with meaningful labels, compute age in years and BMI, and remove biologically implausible outliers.
+
+```{r}
+# Convert columns and create features safely
+data <- data_raw %>%
+  janitor::clean_names() %>%
+  mutate(
+    # If age is in days (common in some datasets)
+    age_years = ifelse(max(age, na.rm = TRUE) > 150, age / 365.25, age),
+    bmi = weight / ( (height / 100) ^ 2 ),
+    gender = factor(gender, levels = c(1,2), labels = c("Female","Male")),
+    cholesterol = factor(cholesterol, levels = c(1,2,3), labels = c("Normal","Above Normal","Well Above Normal")),
+    gluc = factor(gluc, levels = c(1,2,3), labels = c("Normal","Above Normal","Well Above Normal")),
+    smoke = factor(smoke, levels = c(0,1), labels = c("No","Yes")),
+    alco = factor(alco, levels = c(0,1), labels = c("No","Yes")),
+    active = factor(active, levels = c(0,1), labels = c("No","Yes")),
+    cardio = factor(cardio, levels = c(0,1), labels = c("Neg","Pos"))
+  ) %>%
+  # Filter implausible values
+  filter(
+    ap_hi >= 60 & ap_hi <= 240,
+    ap_lo >= 40 & ap_lo <= 180,
+    ap_hi > ap_lo,
+    bmi > 12 & bmi < 60,
+    height >= 120 & height <= 230
+  ) %>%
+  select(-id) # drop id if present
+
+# Quick checks
+cat("Dimensions after cleaning: "); dim(data); cat("\n")
+sum(is.na(data))
+glimpse(data)
+```
+
+## Exploratory Data Analysis (Descriptive Analytics)
+
+We examine distributions, correlations, and group summaries.
+
+### Correlation plot of numeric variables
+
+```{r}
+num_cols <- data %>% select(where(is.numeric)) %>% names()
+if (length(num_cols) >= 2) {
+  M <- cor(data %>% select(all_of(num_cols)), use = "pairwise.complete.obs")
+  corrplot::corrplot(M, method = "color", type = "lower", tl.cex = 0.8, col = RColorBrewer::brewer.pal(n = 8, name = "RdYlBu"))
+} else {
+  plot.new(); text(0.5, 0.5, "Need at least 2 numeric columns for correlation heatmap.")
+}
+```
+
+### Age distribution
+
+```{r}
+ggplot(data, aes(x = age_years)) +
+  geom_histogram(binwidth = 2, fill = "lightblue", color = "black", alpha = 0.8) +
+  labs(title = "Age Distribution of Patients", x = "Age (Years)", y = "Count") +
+  theme_minimal()
+```
+
+### Counts & Means by Outcome
+
+```{r}
+cat("#### Patient Counts by Outcome\n")
+knitr::kable(table(data$cardio), caption = "Patient Counts by Cardio Outcome")
+
+mean_stats <- data %>%
+  select(cardio, age_years, ap_hi, ap_lo, bmi) %>%
+  group_by(cardio) %>%
+  summarise(across(everything(), ~ mean(.x, na.rm = TRUE)))
+knitr::kable(mean_stats, digits = 2, caption = "Average Age, BP and BMI by Outcome")
+```
+
+## Statistical Test: ANOVA (Systolic BP vs Outcome)
+
+```{r}
+anova_model <- aov(ap_hi ~ cardio, data = data)
+knitr::kable(broom::tidy(anova_model), caption = "ANOVA: Systolic BP (ap_hi) vs Cardio Outcome")
+```
+
+## Predictive Modeling
+
+We will build logistic regression and KNN models to predict `cardio`.
+
+```{r}
+set.seed(123)
+# Partition
+train_index <- createDataPartition(data$cardio, p = 0.75, list = FALSE)
+train_data <- data[train_index, ]
+test_data  <- data[-train_index, ]
+
+# Logistic Regression (use a compact set of predictors)
+glm_fit <- glm(cardio ~ age_years + ap_hi + ap_lo + cholesterol + bmi + smoke + active, data = train_data, family = binomial)
+knitr::kable(broom::tidy(glm_fit, exponentiate = TRUE), digits = 3, caption = "Logistic Regression Coefficients (Odds Ratios)")
+```
+
+### Visualize top predictors (odds ratios)
+
+```{r}
+odds_df <- broom::tidy(glm_fit, exponentiate = TRUE) %>% filter(term != "(Intercept)")
+odds_df <- odds_df %>% mutate(term = str_replace_all(term, "`", ""))
+ggplot(odds_df, aes(x = estimate, y = reorder(term, estimate), fill = estimate > 1)) +
+  geom_col(alpha = 0.8) +
+  labs(title = "Odds Ratios from Logistic Regression", x = "Odds Ratio", y = "Predictor") +
+  theme_minimal() +
+  scale_fill_manual(values = c("#4575b4", "#d73027"))
+```
+
+### K-Nearest Neighbors (KNN)
+
+```{r}
+ctrl <- trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = twoClassSummary)
+
+knn_fit <- train(
+  cardio ~ ., data = train_data,
+  method = "knn",
+  trControl = ctrl,
+  preProcess = c("center", "scale", "dummyVars"),
+  tuneGrid = data.frame(k = seq(5, 25, by = 5)),
+  metric = "ROC"
+)
+plot(knn_fit)
+```
+
+### Model evaluation on test set
+
+```{r}
+# GLM predictions
+pred_prob_glm <- predict(glm_fit, test_data, type = "response")
+pred_class_glm <- factor(ifelse(pred_prob_glm > 0.5, "Pos", "Neg"), levels = c("Neg","Pos"))
+
+# KNN predictions
+pred_prob_knn <- predict(knn_fit, test_data, type = "prob")[, "Pos"]
+pred_class_knn <- predict(knn_fit, test_data)
+
+model_stats <- tibble(
+  Model = c("Logistic Regression", "KNN"),
+  Accuracy = c(
+    confusionMatrix(pred_class_glm, test_data$cardio, positive = "Pos")$overall["Accuracy"],
+    confusionMatrix(pred_class_knn, test_data$cardio, positive = "Pos")$overall["Accuracy"]
+  ),
+  AUC = c(
+    as.numeric(pROC::auc(pROC::roc(test_data$cardio, pred_prob_glm, quiet = TRUE))),
+    as.numeric(pROC::auc(pROC::roc(test_data$cardio, pred_prob_knn, quiet = TRUE)))
+  )
+)
+knitr::kable(model_stats, digits = 3, caption = "Model Performance on Test Set")
+```
+
+## Clustering (K-Means) — Discover patient groups
+
+```{r}
+numeric_for_cluster <- data %>% select(where(is.numeric)) %>% scale()
+set.seed(123)
+sample_idx <- sample(1:nrow(numeric_for_cluster), size = min(5000, nrow(numeric_for_cluster)))
+sample_data <- numeric_for_cluster[sample_idx, ]
+
+km_fit <- kmeans(sample_data, centers = 3, nstart = 25)
+fviz_cluster(km_fit, data = sample_data, geom = "point", ellipse.type = "convex", palette = "Set2", ggtheme = theme_minimal(), main = "K-Means Clusters (k=3)")
+
+# Full clustering for table
+km_full <- kmeans(numeric_for_cluster, centers = 3, nstart = 25)
+cluster_table <- table(Cluster = km_full$cluster, Outcome = data$cardio)
+knitr::kable(cluster_table, caption = "Cluster Membership vs Actual Outcome")
+knitr::kable(prop.table(cluster_table, 1), digits = 2, caption = "Proportion Outcome by Cluster")
+```
+
+## Additional Visualizations
+
+### Glucose levels by outcome
+
+```{r}
+ggplot(data, aes(x = cardio, y = gluc, fill = cardio)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Glucose Levels by Cardio Outcome", x = "Cardio Outcome", y = "Glucose Level") +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set2")
+```
+
+### Age vs Systolic BP, colored by outcome
+
+```{r}
+ggplot(data, aes(x = age_years, y = ap_hi, color = cardio)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "loess", se = TRUE) +
+  labs(title = "Age vs Systolic BP (ap_hi) by Cardio Outcome", x = "Age (Years)", y = "Systolic BP") +
+  theme_minimal()
+```
+
+## Simple Linear Model (example)
+
+```{r}
+lm_model <- lm(ap_hi ~ age_years, data = data)
+summary(lm_model)
+
+data$pred_ap_hi <- predict(lm_model)
+ggplot(data, aes(x = age_years, y = ap_hi)) +
+  geom_point(alpha = 0.2) +
+  geom_line(aes(y = pred_ap_hi), color = "red", linewidth = 1) +
+  labs(title = "Linear Regression: Systolic BP vs Age", x = "Age (Years)", y = "Systolic BP") +
+  theme_minimal()
+```
+
+## KNN (base) example and confusion matrix
+
+```{r}
+# Prepare a numeric-only frame for KNN base example
+df_knn <- data %>% select(all_of(num_cols), cardio) %>% drop_na()
+df_knn$cardio <- factor(df_knn$cardio)
+
+set.seed(123)
+idx <- createDataPartition(df_knn$cardio, p = 0.7, list = FALSE)
+train_knn <- df_knn[idx, ]; test_knn <- df_knn[-idx, ]
+
+# Scale numeric features
+scaler <- preProcess(train_knn %>% select(-cardio), method = c("center","scale"))
+trainX <- predict(scaler, train_knn %>% select(-cardio)) %>% as.matrix()
+testX  <- predict(scaler, test_knn %>% select(-cardio)) %>% as.matrix()
+trainY <- train_knn$cardio
+
+k_safe <- min(5, min(table(trainY)))
+knn_pred <- class::knn(train = trainX, test = testX, cl = trainY, k = k_safe)
+
+cat("KNN confusion matrix (base::knn):\n")
+print(table(Predicted = knn_pred, Actual = test_knn$cardio))
+```
+
+## Conclusion & Insights
+
+- Systolic blood pressure (`ap_hi`), age, and cholesterol consistently show up as important predictors of CVD.
+- Logistic regression gives interpretable odds ratios; KNN is a useful non-parametric comparator.
+- K-Means reveals clusters of patients that align substantially with actual cardio outcomes, indicating separable groups in feature-space.
+- Use this RMD as a reproducible template; change file paths and tune models (feature selection, hyperparameters) for production-ready performance.
+
